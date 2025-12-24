@@ -1,0 +1,77 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-agent-grpc-server"
+version = "0.1.0"
+description = "gRPC server wrapping the Claude Agent SDK for network-accessible Claude sessions"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "TAS Ltd", email = "dev@tas.ltd"}
+]
+keywords = ["claude", "anthropic", "grpc", "agent", "sdk", "ai"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "grpcio>=1.60.0",
+    "grpcio-tools>=1.60.0",
+    "protobuf>=4.25.0",
+    "claude-agent-sdk>=0.1.18",
+    "pydantic>=2.5.0",
+    "pydantic-settings>=2.1.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.5.0",
+    "grpcio-testing>=1.60.0",
+]
+
+[project.scripts]
+claude-grpc-server = "claude_agent_grpc_server.server:main"
+
+[project.urls]
+Homepage = "https://github.com/tasltd/claude-agent-grpc-tools"
+Documentation = "https://github.com/tasltd/claude-agent-grpc-tools#readme"
+Repository = "https://github.com/tasltd/claude-agent-grpc-tools"
+Issues = "https://github.com/tasltd/claude-agent-grpc-tools/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+claude_agent_grpc_server = ["py.typed"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "B", "C4", "SIM"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
