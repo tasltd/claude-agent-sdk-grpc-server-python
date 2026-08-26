@@ -39,6 +39,29 @@ from claude_agent_sdk.types import (
 
 logger = logging.getLogger(__name__)
 
+# Fix(TAS-624): a turn boundary marker placed on a session's queue by the
+# persistent receive loop. `send_prompt` returns when it drains one, which is
+# what gives the RPC per-turn semantics -- the rest of the chain already assumes
+# them. A sentinel object rather than None so a future None message cannot be
+# mistaken for the end of a turn.
+_TURN_END = object()
+
+# Fix(TAS-624): how many undrained messages a session's queue keeps before it
+# stops retaining more of the CURRENT turn. The queue is deliberately UNBOUNDED
+# so the receive loop can never block on `put` -- blocking is the exact failure
+# this fix exists to remove, because the SDK services its 100-slot message
+# stream from the same task that routes control_response frames and dispatches
+# hook callbacks. Once that task parks, interrupt(), set_model() and every
+# PreToolUse hook stop being answered, with no error anywhere.
+#
+# So the cap is enforced by DROPPING rather than by back-pressure, and only for
+# a reader that has gone away mid-turn (a cancelled RPC while the CLI keeps
+# producing). Dropped messages are still written to _session_outputs, which is
+# the durable record `save_session_outputs`/`load_session_outputs` use -- the
+# queue is only the live view. A turn boundary is never dropped; losing one
+# would hang the next RPC forever.
+_MAX_UNDRAINED_MESSAGES = 2000
+
 
 @dataclass
 class SessionCredentials:
@@ -249,6 +272,13 @@ class SessionManager:
 
         # Subagent tracking (for SubagentStop hook)
         self._subagents: Dict[str, SubagentInfo] = {}  # agent_id -> SubagentInfo
+
+        # Fix(TAS-624): one persistent consumer of the SDK stream per session,
+        # feeding a queue that each SendPrompt RPC drains for the length of one
+        # turn. See _receive_loop for why the consumer must outlive the RPC.
+        self._receive_tasks: Dict[str, asyncio.Task] = {}  # session_id -> consumer task
+        self._turn_queues: Dict[str, asyncio.Queue] = {}   # session_id -> live message queue
+        self._dropped_messages: Dict[str, int] = {}        # session_id -> count dropped this turn
 
         # Find Claude CLI path for OAuth operations
         self._cli_path = self._find_cli()
@@ -932,6 +962,210 @@ class SessionManager:
         """Get the tool execution history for a session."""
         return self._session_tool_history.get(session_id, [])
 
+    # ------------------------------------------------------------------
+    # Fix(TAS-624): persistent SDK consumer
+    # ------------------------------------------------------------------
+
+    def _ensure_receive_loop(self, session_id: str, client: ClaudeSDKClient) -> asyncio.Queue:
+        """Guarantee this session has a live consumer of the SDK stream.
+
+        Returns the session's queue. Idempotent, and restarts the task if a
+        previous one died -- a session whose consumer is gone is exactly the
+        state that strands the SDK's buffer, so "missing" must be recoverable
+        rather than fatal.
+        """
+        queue = self._turn_queues.get(session_id)
+        if queue is None:
+            queue = asyncio.Queue()
+            self._turn_queues[session_id] = queue
+
+        task = self._receive_tasks.get(session_id)
+        if task is None or task.done():
+            if task is not None and task.done():
+                exc = task.exception() if not task.cancelled() else None
+                logger.warning(
+                    f"Session {session_id}: receive loop had stopped "
+                    f"({exc!r}); restarting so the SDK stream keeps a consumer"
+                )
+            self._receive_tasks[session_id] = asyncio.create_task(
+                self._receive_loop(session_id, client)
+            )
+        return queue
+
+    def _offer(self, session_id: str, queue: asyncio.Queue, item: Any) -> None:
+        """Put an item on a session's queue WITHOUT ever blocking.
+
+        The no-blocking property is the whole point of this fix, so this method
+        must never await. Past the retention cap, ordinary messages are dropped
+        (they remain in _session_outputs) while turn boundaries always go on --
+        dropping one would leave the next RPC waiting for an end that never
+        comes.
+        """
+        if item is _TURN_END:
+            queue.put_nowait(item)
+            return
+
+        if queue.qsize() >= _MAX_UNDRAINED_MESSAGES:
+            dropped = self._dropped_messages.get(session_id, 0) + 1
+            self._dropped_messages[session_id] = dropped
+            if dropped == 1:
+                logger.warning(
+                    f"Session {session_id}: over {_MAX_UNDRAINED_MESSAGES} undrained "
+                    f"messages -- nobody is reading this turn. Dropping from the live "
+                    f"queue only; output is still recorded in session outputs."
+                )
+            return
+
+        queue.put_nowait(item)
+
+    async def _receive_loop(self, session_id: str, client: ClaudeSDKClient) -> None:
+        """Consume the SDK message stream for the LIFE OF THE CLIENT.
+
+        Fix(TAS-624). send_prompt used to iterate ``client.receive_messages()``
+        itself, with no break on ResultMessage. Four things followed from that,
+        and all four are removed by moving the consumer out here:
+
+        1. **The RPC never completed.** ``receive_messages()`` ends only when the
+           CLI transport closes, and a ``ClaudeSDKClient`` keeps its CLI alive
+           across turns by design -- so the generator parked forever at the
+           ``async for`` and the two statements after it (status = "idle",
+           save_session_outputs) were unreachable in normal operation.
+        2. **The session never went idle.** Tier2Session.is_idle() reads a status
+           that only got set after that loop exited, so a T2/T3 session reported
+           RUNNING forever after its first prompt.
+        3. **Turn 2 onward split its output.** Each prompt began a NEW consumer of
+           the SAME anyio memory object stream, which delivers each message to
+           exactly one receiver. The turn-1 RPC was still pulling, so roughly half
+           of every later turn went to the abandoned iterator.
+        4. **The control plane could die.** An async generator only advances when
+           its consumer pulls. Whenever it was suspended at a ``yield`` -- gRPC
+           flow control, a slow or cancelled client, or the question path that
+           yields and then awaits an answer -- nothing drained the SDK's 100-slot
+           buffer. Once full, the SDK's reader task parks, and interrupt(),
+           set_model() and every hook callback stop working with no error raised.
+
+        A ResultMessage is therefore a **turn boundary, not a stop condition**:
+        end-of-turn work runs and the loop keeps consuming.
+        """
+        queue = self._turn_queues[session_id]
+        try:
+            async for message in client.receive_messages():
+                entry = self._sessions.get(session_id)
+                if entry is None:
+                    # Session deleted underneath us; nothing left to serve.
+                    logger.info(f"Session {session_id}: gone, ending receive loop")
+                    return
+                session_info = entry[0]
+
+                # Isolate per-message failures. A conversion or persistence bug is
+                # OURS, and letting one abort the loop strands the SDK buffer --
+                # the precise failure this loop exists to prevent.
+                try:
+                    converted = self._convert_message(message, session_info)
+                except Exception as exc:
+                    logger.error(
+                        f"Session {session_id}: failed to convert "
+                        f"{type(message).__name__}: {exc}. Continuing to drain."
+                    )
+                    converted = []
+
+                for stream_msg in converted:
+                    try:
+                        self._track_and_persist(session_id, stream_msg)
+                    except Exception as exc:
+                        logger.error(
+                            f"Session {session_id}: failed to record "
+                            f"{stream_msg.type}: {exc}. Continuing to drain."
+                        )
+                    self._offer(session_id, queue, stream_msg)
+
+                if isinstance(message, ResultMessage):
+                    session_info.status = "idle"
+                    dropped = self._dropped_messages.pop(session_id, 0)
+                    if dropped:
+                        logger.warning(
+                            f"Session {session_id}: turn ended having dropped {dropped} "
+                            f"message(s) from the live queue (still in session outputs)"
+                        )
+                    try:
+                        self.save_session_outputs(session_id)
+                    except Exception as exc:
+                        logger.error(f"Session {session_id}: save outputs failed - {exc}")
+                    logger.info(f"Session {session_id}: prompt completed")
+                    self._offer(session_id, queue, _TURN_END)
+
+            # Falling out means the SDK CLOSED the stream: the CLI process is gone.
+            logger.info(f"Session {session_id}: SDK stream closed, receive loop ending")
+            self._finish_turn_with_error(session_id, queue, "Claude CLI transport closed")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"Session {session_id}: receive loop error - {e}")
+            entry = self._sessions.get(session_id)
+            if entry is not None:
+                entry[0].status = "error"
+            self._finish_turn_with_error(session_id, queue, str(e))
+
+    def _finish_turn_with_error(
+        self, session_id: str, queue: asyncio.Queue, detail: str
+    ) -> None:
+        """Release any RPC waiting on this session, with the reason.
+
+        Without this an RPC in progress when the transport dies would wait on a
+        turn boundary that can no longer arrive -- trading the old never-ending
+        turn for a new one.
+        """
+        self._offer(session_id, queue, StreamMessage(type="error", content=detail, is_error=True))
+        self._offer(session_id, queue, _TURN_END)
+
+    def _track_and_persist(self, session_id: str, stream_msg: StreamMessage) -> None:
+        """Record a converted message: tool audit trail, then output buffer.
+
+        Fix(TAS-624): this runs in the receive loop, not in the RPC, so the audit
+        trail and the recovery buffer stay complete even when no client is
+        reading -- a cancelled RPC used to take the tool history with it.
+        """
+        if stream_msg.type == "tool_use" and stream_msg.tool_id:
+            self._start_tool_execution(
+                session_id,
+                stream_msg.tool_id,
+                stream_msg.tool_name or "unknown",
+                stream_msg.tool_input or {},
+            )
+        elif stream_msg.type == "tool_result" and stream_msg.tool_id:
+            self._complete_tool_execution(
+                session_id,
+                stream_msg.tool_id,
+                result=stream_msg.content,
+                is_error=stream_msg.is_error,
+            )
+        elif stream_msg.type == "blocked_command" and stream_msg.tool_id:
+            self._complete_tool_execution(
+                session_id,
+                stream_msg.tool_id,
+                result=stream_msg.content,
+                is_error=True,
+                was_blocked=True,
+            )
+
+        self._persist_output(session_id, stream_msg)
+
+    @staticmethod
+    def _drain_stale(queue: asyncio.Queue) -> int:
+        """Empty a queue before a new turn begins.
+
+        Anything still on it belongs to a PREVIOUS turn whose reader went away.
+        Replaying it as part of the new turn would attribute one prompt's output
+        to another; it is already in the session's output buffer either way.
+        """
+        dropped = 0
+        while True:
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return dropped
+            dropped += 1
+
     async def send_prompt(
         self, session_id: str, prompt: str
     ) -> AsyncIterator[StreamMessage]:
@@ -978,58 +1212,45 @@ class SessionManager:
                 await client.connect()
                 self._sessions[session_id] = (session_info, config, client)
 
-            # Send prompt and stream responses
+            # Fix(TAS-624): the SDK stream is consumed by a persistent background
+            # loop, not by this generator. This RPC only drains the queue that
+            # loop fills, for the length of ONE turn. See _receive_loop for the
+            # four defects that consuming it here caused.
+            queue = self._ensure_receive_loop(session_id, client)
+
+            # Anything already queued belongs to a previous turn whose reader
+            # went away -- it is in the output buffer, and replaying it here
+            # would bill one prompt's output to another.
+            stale = self._drain_stale(queue)
+            if stale:
+                logger.info(
+                    f"Session {session_id}: discarded {stale} message(s) left "
+                    f"over from an earlier turn before sending a new prompt"
+                )
+
             await client.send(prompt)
 
-            async for message in client.receive_messages():
-                for stream_msg in self._convert_message(message, session_info):
-                    # Track tool executions for audit logging
-                    if stream_msg.type == "tool_use" and stream_msg.tool_id:
-                        self._start_tool_execution(
-                            session_id,
-                            stream_msg.tool_id,
-                            stream_msg.tool_name or "unknown",
-                            stream_msg.tool_input or {},
-                        )
-                    elif stream_msg.type == "tool_result" and stream_msg.tool_id:
-                        self._complete_tool_execution(
-                            session_id,
-                            stream_msg.tool_id,
-                            result=stream_msg.content,
-                            is_error=stream_msg.is_error,
-                        )
-                    elif stream_msg.type == "blocked_command" and stream_msg.tool_id:
-                        # For blocked commands, complete execution with was_blocked=True
-                        self._complete_tool_execution(
-                            session_id,
-                            stream_msg.tool_id,
-                            result=stream_msg.content,
-                            is_error=True,
-                            was_blocked=True,
-                        )
+            while True:
+                item = await queue.get()
+                if item is _TURN_END:
+                    return
 
-                    # Persist output for session recovery
-                    self._persist_output(session_id, stream_msg)
-
-                    # Check for question in the message
-                    if stream_msg.type == "question":
-                        # Wait for answer before continuing
-                        yield stream_msg
-                        answers = await self._ask_user_hook(
-                            session_id,
-                            {"tool_input": {"questions": stream_msg.question_options}},
-                            stream_msg.question_id,
-                            None
-                        )
-                        # Answer is automatically sent back to SDK via hook
-                    else:
-                        yield stream_msg
-
-            session_info.status = "idle"
-            logger.info(f"Session {session_id}: prompt completed")
-
-            # Auto-save outputs after prompt completes
-            self.save_session_outputs(session_id)
+                stream_msg = item
+                if stream_msg.type == "question":
+                    # Awaiting the answer suspends THIS generator, which is now
+                    # safe: the receive loop goes on draining the SDK meanwhile.
+                    # Before the fix, this await was the most reliable way to
+                    # fill the SDK's buffer and kill the control plane.
+                    yield stream_msg
+                    await self._ask_user_hook(
+                        session_id,
+                        {"tool_input": {"questions": stream_msg.question_options}},
+                        stream_msg.question_id,
+                        None
+                    )
+                    # The hook sends the answer back to the SDK.
+                else:
+                    yield stream_msg
 
         except Exception as e:
             session_info.status = "error"
@@ -1135,6 +1356,18 @@ class SessionManager:
         """Delete/close a session."""
         if session_id in self._sessions:
             session_info, config, client = self._sessions.pop(session_id)
+
+            # Fix(TAS-624): stop this session's persistent SDK consumer BEFORE
+            # disconnecting, then release any RPC still waiting on a turn
+            # boundary that will now never arrive.
+            task = self._receive_tasks.pop(session_id, None)
+            if task is not None and not task.done():
+                task.cancel()
+            queue = self._turn_queues.pop(session_id, None)
+            if queue is not None:
+                # Unbounded, so put_nowait cannot raise QueueFull here.
+                queue.put_nowait(_TURN_END)
+            self._dropped_messages.pop(session_id, None)
 
             # Disconnect client if connected
             if client:
