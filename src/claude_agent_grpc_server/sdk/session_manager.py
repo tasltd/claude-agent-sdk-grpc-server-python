@@ -1100,7 +1100,7 @@ class SessionManager:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.error(f"Session {session_id}: receive loop error - {e}")
+            logger.exception(f"Session {session_id}: receive loop error - {e}")
             entry = self._sessions.get(session_id)
             if entry is not None:
                 entry[0].status = "error"
@@ -1199,7 +1199,19 @@ class SessionManager:
                 model=config.model,
                 cwd=config.project_path,
                 permission_mode=config.permission_mode,
-                allowed_tools=config.allowed_tools if config.allowed_tools else None,
+                # ClaudeAgentOptions.allowed_tools is declared `list[str]`
+                # with default_factory=list, so None was never a legal value --
+                # it merely used to be harmless, because every consumer of it
+                # was behind a truthiness check. The Skills feature added an
+                # unguarded one (`list(self._options.allowed_tools)` in
+                # subprocess_cli._apply_skills_defaults, reached from
+                # _build_command on EVERY connect), so from claude-agent-sdk
+                # 0.2.x an empty allow-list raises
+                # `TypeError: 'NoneType' object is not iterable` before the CLI
+                # is even spawned -- i.e. every Tier 2/Tier 3 session that does
+                # not name an explicit allow-list, which is the common case.
+                # Pass the empty list the type always asked for.
+                allowed_tools=config.allowed_tools or [],
                 disallowed_tools=config.disallowed_tools if config.disallowed_tools else ["EnterPlanMode", "ExitPlanMode"],
                 max_turns=config.max_turns,
                 continue_conversation=config.continue_conversation,
@@ -1228,7 +1240,20 @@ class SessionManager:
                     f"over from an earlier turn before sending a new prompt"
                 )
 
-            await client.send(prompt)
+            # ClaudeSDKClient has no `send`. The method that writes a prompt
+            # into a streaming session is `query(prompt, session_id="default")`,
+            # and generate_summary in this same file already calls it -- this one
+            # call site was the outlier. It raised
+            # `AttributeError: 'ClaudeSDKClient' object has no attribute 'send'`
+            # on the FIRST turn of every Tier 2/Tier 3 session, so no prompt has
+            # ever reached Claude through this path.
+            #
+            # It stayed invisible because the test double defines send(): a stub
+            # is free to implement an interface the real class does not have, and
+            # a suite built on one then proves only that the stub is
+            # self-consistent. test_stub_matches_sdk_interface.py now pins the
+            # double to the real class so this cannot recur.
+            await client.query(prompt)
 
             while True:
                 item = await queue.get()
@@ -1254,7 +1279,11 @@ class SessionManager:
 
         except Exception as e:
             session_info.status = "error"
-            logger.error(f"Session {session_id}: error - {e}")
+            # logger.exception, not logger.error: the message alone stripped the
+            # traceback, and the defect this replaced was a TypeError raised
+            # inside the SDK's own command builder. Without the stack the only
+            # evidence anywhere was the bare str(e) echoed to the client.
+            logger.exception(f"Session {session_id}: error - {e}")
             yield StreamMessage(
                 type="error",
                 content=str(e),

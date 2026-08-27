@@ -94,7 +94,14 @@ class StubSDKClient:
     async def disconnect(self) -> None:
         self.disconnected = True
 
-    async def send(self, prompt: str) -> None:
+    async def query(self, prompt: str, session_id: str = "default") -> None:
+        """Named and shaped like ClaudeSDKClient.query, deliberately.
+
+        This double used to expose ``send()``, which the real class has never
+        had -- so the suite was green while every real Tier 2/Tier 3 turn died
+        with AttributeError. test_stub_matches_sdk_interface.py now enforces
+        the correspondence.
+        """
         self.sent.append(prompt)
         if self._script:
             for message in self._script.pop(0):
