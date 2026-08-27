@@ -42,9 +42,43 @@ logger = logging.getLogger(__name__)
 # Fix(TAS-624): a turn boundary marker placed on a session's queue by the
 # persistent receive loop. `send_prompt` returns when it drains one, which is
 # what gives the RPC per-turn semantics -- the rest of the chain already assumes
-# them. A sentinel object rather than None so a future None message cannot be
+# them. A distinct type rather than None so a future None message cannot be
 # mistaken for the end of a turn.
-_TURN_END = object()
+#
+# Fix(TAS-808): the marker is TAGGED with which turn it closes, because a bare
+# sentinel made correctness depend on `asyncio.Queue` waking getters in FIFO
+# order -- load-bearing, and documented nowhere near the call site.
+#
+# Interrupting a turn makes the CLI emit its ResultMessage ~1.45s LATER
+# (measured), while `interrupt()` marks the session idle at once. So a fused
+# continuation is dispatched, and starts reading, before the interrupted turn's
+# marker exists. Normally FIFO saves it: the interrupted RPC has been parked
+# longer and takes the stale marker. But when that RPC is gone -- client
+# disconnected, WebSocket dropped, caller cancelled -- the continuation is the
+# only getter. It took the stale marker and returned IMMEDIATELY WITH NO
+# OUTPUT: prompt accepted, nothing back, session idle, no error anywhere.
+#
+# Turns are paired by sequence: the k-th prompt on a session is closed by the
+# k-th ResultMessage, because the CLI emits exactly one per prompt (including
+# on interrupt). A reader that drains a marker older than its own drops it and
+# keeps waiting.
+class _TurnEnd:
+    """End of one turn. `seq` is None for an unconditional release.
+
+    An unconditional marker is used where the turn can no longer complete at
+    all -- the transport died, or the session was closed -- so whoever is
+    waiting must be released regardless of which turn they were serving.
+    Otherwise they would wait for an end that can never arrive, which is the
+    never-ending turn TAS-624 removed.
+    """
+
+    __slots__ = ("seq",)
+
+    def __init__(self, seq: Optional[int] = None) -> None:
+        self.seq = seq
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
+        return f"_TurnEnd(seq={self.seq})"
 
 # Fix(TAS-624): how many undrained messages a session's queue keeps before it
 # stops retaining more of the CURRENT turn. The queue is deliberately UNBOUNDED
@@ -278,6 +312,11 @@ class SessionManager:
         # turn. See _receive_loop for why the consumer must outlive the RPC.
         self._receive_tasks: Dict[str, asyncio.Task] = {}  # session_id -> consumer task
         self._turn_queues: Dict[str, asyncio.Queue] = {}   # session_id -> live message queue
+        # Fix(TAS-808): the k-th prompt is closed by the k-th ResultMessage.
+        # Kept separately because they legitimately diverge for ~1.45s while an
+        # interrupted turn's result is still in flight -- that gap IS the bug.
+        self._prompt_seq: Dict[str, int] = {}   # session_id -> prompts sent
+        self._result_seq: Dict[str, int] = {}   # session_id -> results seen
         self._dropped_messages: Dict[str, int] = {}        # session_id -> count dropped this turn
 
         # Find Claude CLI path for OAuth operations
@@ -1001,7 +1040,7 @@ class SessionManager:
         dropping one would leave the next RPC waiting for an end that never
         comes.
         """
-        if item is _TURN_END:
+        if isinstance(item, _TurnEnd):
             queue.put_nowait(item)
             return
 
@@ -1092,7 +1131,9 @@ class SessionManager:
                     except Exception as exc:
                         logger.error(f"Session {session_id}: save outputs failed - {exc}")
                     logger.info(f"Session {session_id}: prompt completed")
-                    self._offer(session_id, queue, _TURN_END)
+                    seq = self._result_seq.get(session_id, 0) + 1
+                    self._result_seq[session_id] = seq
+                    self._offer(session_id, queue, _TurnEnd(seq))
 
             # Falling out means the SDK CLOSED the stream: the CLI process is gone.
             logger.info(f"Session {session_id}: SDK stream closed, receive loop ending")
@@ -1116,7 +1157,9 @@ class SessionManager:
         turn for a new one.
         """
         self._offer(session_id, queue, StreamMessage(type="error", content=detail, is_error=True))
-        self._offer(session_id, queue, _TURN_END)
+        # Unconditional: the transport is gone, so no sequenced marker can ever
+        # arrive for whichever turn the waiter is serving.
+        self._offer(session_id, queue, _TurnEnd(None))
 
     def _track_and_persist(self, session_id: str, stream_msg: StreamMessage) -> None:
         """Record a converted message: tool audit trail, then output buffer.
@@ -1253,12 +1296,29 @@ class SessionManager:
             # a suite built on one then proves only that the stub is
             # self-consistent. test_stub_matches_sdk_interface.py now pins the
             # double to the real class so this cannot recur.
+            # Fix(TAS-808): claim this turn's number BEFORE the prompt goes in,
+            # so the marker the CLI will eventually emit for it is already
+            # matchable. Claiming after would leave a window where a result
+            # arriving fast is tagged higher than the turn that caused it.
+            my_seq = self._prompt_seq.get(session_id, 0) + 1
+            self._prompt_seq[session_id] = my_seq
+
             await client.query(prompt)
 
             while True:
                 item = await queue.get()
-                if item is _TURN_END:
-                    return
+                if isinstance(item, _TurnEnd):
+                    if item.seq is None or item.seq >= my_seq:
+                        return
+                    # Older than mine: an earlier turn (usually one that was
+                    # interrupted) has only just closed, and its own reader is
+                    # gone. Before this check the FIRST such marker ended THIS
+                    # turn instead, returning with no output at all.
+                    logger.info(
+                        f"Session {session_id}: dropped a turn marker for turn "
+                        f"{item.seq} while serving turn {my_seq}"
+                    )
+                    continue
 
                 stream_msg = item
                 if stream_msg.type == "question":
@@ -1395,8 +1455,11 @@ class SessionManager:
             queue = self._turn_queues.pop(session_id, None)
             if queue is not None:
                 # Unbounded, so put_nowait cannot raise QueueFull here.
-                queue.put_nowait(_TURN_END)
+                # Unconditional: the session is going away, release everyone.
+                queue.put_nowait(_TurnEnd(None))
             self._dropped_messages.pop(session_id, None)
+            self._prompt_seq.pop(session_id, None)
+            self._result_seq.pop(session_id, None)
 
             # Disconnect client if connected
             if client:

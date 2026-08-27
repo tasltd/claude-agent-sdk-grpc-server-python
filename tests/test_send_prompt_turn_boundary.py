@@ -32,7 +32,7 @@ from claude_agent_sdk.types import AssistantMessage, ResultMessage, TextBlock
 
 from claude_agent_grpc_server.sdk.session_manager import (
     _MAX_UNDRAINED_MESSAGES,
-    _TURN_END,
+    _TurnEnd,
     SessionConfig,
     SessionInfo,
     SessionManager,
@@ -430,12 +430,14 @@ class TestExcess:
 
         for i in range(_MAX_UNDRAINED_MESSAGES + 50):
             manager._offer("s1", queue, StreamMessage(type="text", content=str(i)))
-        manager._offer("s1", queue, _TURN_END)
+        manager._offer("s1", queue, _TurnEnd(1))
 
         drained = []
         while not queue.empty():
             drained.append(queue.get_nowait())
-        assert _TURN_END in drained
+        assert any(isinstance(d, _TurnEnd) for d in drained), (
+            "the turn boundary must survive the retention cap -- dropping it\n             leaves the next RPC waiting for an end that never comes"
+        )
 
     async def test_a_long_turn_delivers_every_message(self, manager):
         """Ten times the design count, with a reader present: nothing is lost."""

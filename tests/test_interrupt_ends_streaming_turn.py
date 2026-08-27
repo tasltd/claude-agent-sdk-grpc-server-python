@@ -25,6 +25,7 @@ routinely sent while the interrupted turn's `_TURN_END` is still in flight, and
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from datetime import datetime, timezone
 
 import pytest
@@ -160,11 +161,15 @@ async def test_the_continuation_turn_does_not_eat_the_interrupts_turn_end(manage
       4. only now does the interrupt's ResultMessage arrive
       5. turn 2's real output follows
 
-    If B consumed that stale `_TURN_END` it would return empty and the
-    continuation would look like a silent no-op. It does not, because
-    asyncio.Queue wakes getters in FIFO order and A has been waiting longer.
-    That ordering is load-bearing and undocumented at the call site, which is
-    the entire reason this test exists.
+    If B consumed that stale turn marker it would return empty and the
+    continuation would look like a silent no-op.
+
+    It used to be safe only by accident: `asyncio.Queue` wakes getters in FIFO
+    order and A had been waiting longer. That was load-bearing and undocumented
+    at the call site, and it collapsed the moment A stopped waiting -- see
+    `test_the_continuation_survives_a_vanished_reader` below, which is the case
+    that actually failed. Since TAS-808 the marker carries its turn number, so
+    neither test depends on wake order.
     """
     client = StubSDKClient()
     _install_session(manager, client)
@@ -195,7 +200,7 @@ async def test_the_continuation_turn_does_not_eat_the_interrupts_turn_end(manage
 
     assert any("counting 1" in (m.content or "") for m in a_messages)
     assert any("here is the summary" in (m.content or "") for m in b_messages), \
-        "the continuation turn returned without its own output -- it ate the stale _TURN_END"
+        "the continuation turn returned without its own output -- it ate the stale turn marker"
     assert not any("here is the summary" in (m.content or "") for m in a_messages)
     assert client.sent[-1].startswith("[continuing]")
 
@@ -204,3 +209,121 @@ async def test_the_continuation_turn_does_not_eat_the_interrupts_turn_end(manage
 async def test_interrupt_on_an_unknown_session_raises(manager):  # noqa: F811
     with pytest.raises(ValueError, match="Session not found"):
         await manager.interrupt("no-such-session")
+
+
+@pytest.mark.asyncio
+async def test_the_continuation_survives_a_vanished_reader(manager):  # noqa: F811
+    """The failing case from TAS-808: nobody is left to absorb the stale marker.
+
+    Identical to the test above except that RPC A is CANCELLED before the
+    interrupt's ResultMessage lands -- the gRPC client disconnected, the
+    WebSocket dropped, the caller went away. Real, and it happens precisely in
+    the ~1.45s window between `interrupt()` returning and the CLI emitting its
+    result.
+
+    With A gone, the continuation is the ONLY getter, so FIFO ordering protects
+    nothing. Before the marker carried a turn number, B took the stale one and
+    returned immediately with no output: prompt accepted, nothing came back,
+    session idle, and no error raised anywhere for anyone to notice.
+    """
+    client = StubSDKClient()
+    _install_session(manager, client)
+    client.script_turn([_assistant("counting 1")])
+
+    task_a = asyncio.create_task(_drain(manager.send_prompt("s1", "count to 400"), timeout=3.0))
+    await asyncio.sleep(0.05)
+
+    await manager.interrupt("s1")
+
+    # The reader for turn 1 goes away BEFORE its result arrives. This is the
+    # only difference from the test above, and it is the whole bug.
+    task_a.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task_a
+
+    task_b = asyncio.create_task(
+        _drain(manager.send_prompt("s1", "[continuing] now summarise instead"), timeout=3.0)
+    )
+    await asyncio.sleep(0.05)
+
+    client.emit(_interrupted_result())      # turn 1's marker, with no reader
+    await asyncio.sleep(0.05)
+    assert not task_b.done(), (
+        "the continuation returned as soon as the interrupted turn's marker "
+        "arrived -- it consumed a marker belonging to turn 1"
+    )
+
+    client.emit(_assistant("here is the summary"))
+    client.emit(ResultMessage(
+        subtype="success", duration_ms=10, duration_api_ms=8, is_error=False,
+        num_turns=2, session_id="sdk-session", total_cost_usd=0.01,
+    ))
+    b_messages = await asyncio.wait_for(task_b, timeout=3.0)
+
+    assert any("here is the summary" in (m.content or "") for m in b_messages), \
+        "the continuation produced no output at all -- the silent no-op TAS-808 describes"
+
+
+@pytest.mark.asyncio
+async def test_a_transport_death_still_releases_a_waiting_turn(manager):  # noqa: F811
+    """Sequencing must not resurrect the never-ending turn TAS-624 removed.
+
+    When the transport dies there is no result to number, so the marker is
+    emitted unconditionally. A reader that insisted on its own turn number
+    would wait forever for an end that cannot arrive.
+    """
+    client = StubSDKClient()
+    _install_session(manager, client)
+    client.script_turn([_assistant("working")])
+
+    task = asyncio.create_task(_drain(manager.send_prompt("s1", "go"), timeout=3.0))
+    await asyncio.sleep(0.05)
+
+    queue = manager._turn_queues["s1"]
+    manager._finish_turn_with_error("s1", queue, "Claude CLI transport closed")
+
+    messages = await asyncio.wait_for(task, timeout=3.0)
+    assert any(m.is_error for m in messages), "the reason must reach the caller"
+
+
+@pytest.mark.asyncio
+async def test_deleting_a_session_releases_a_waiting_turn(manager):  # noqa: F811
+    """Same unconditional-release requirement, via the other exit."""
+    client = StubSDKClient()
+    _install_session(manager, client)
+    client.script_turn([_assistant("working")])
+
+    task = asyncio.create_task(_drain(manager.send_prompt("s1", "go"), timeout=3.0))
+    await asyncio.sleep(0.05)
+
+    await manager.delete_session("s1")
+    await asyncio.wait_for(task, timeout=3.0)
+
+
+@pytest.mark.asyncio
+async def test_turn_numbers_do_not_leak_across_sessions(manager):  # noqa: F811
+    """Sequences are per-session; one session's turn 1 must not close another's."""
+    a, b = StubSDKClient(), StubSDKClient()
+    _install_session(manager, a, session_id="sA")
+    _install_session(manager, b, session_id="sB")
+    a.script_turn([_assistant("from A")])
+    b.script_turn([_assistant("from B")])
+
+    task_a = asyncio.create_task(_drain(manager.send_prompt("sA", "go"), timeout=3.0))
+    task_b = asyncio.create_task(_drain(manager.send_prompt("sB", "go"), timeout=3.0))
+    await asyncio.sleep(0.05)
+
+    a.emit(ResultMessage(
+        subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
+        num_turns=1, session_id="sdk-session", total_cost_usd=0.0,
+    ))
+    msgs_a = await asyncio.wait_for(task_a, timeout=3.0)
+    assert any("from A" in (m.content or "") for m in msgs_a)
+    assert not task_b.done(), "session A's turn marker ended session B's turn"
+
+    b.emit(ResultMessage(
+        subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
+        num_turns=1, session_id="sdk-session", total_cost_usd=0.0,
+    ))
+    msgs_b = await asyncio.wait_for(task_b, timeout=3.0)
+    assert any("from B" in (m.content or "") for m in msgs_b)
