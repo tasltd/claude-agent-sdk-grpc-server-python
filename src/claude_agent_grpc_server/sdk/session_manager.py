@@ -153,6 +153,32 @@ class SessionInfo:
     user_email: Optional[str] = None
 
 
+def context_tokens_from_usage(usage: Any) -> Optional[int]:
+    """Total prompt tokens from an SDK usage dict -- cache-aware.
+
+    Under prompt caching (always on for SDK sessions) the API splits the prompt
+    across three fields:
+
+        input_tokens                  - uncached new tokens (routinely 1-2)
+        cache_read_input_tokens       - prompt prefix served from cache
+        cache_creation_input_tokens   - prompt prefix written to cache
+
+    The context actually consumed is their SUM. Output tokens are not context
+    input, so they are excluded.
+
+    Returns None when there is nothing to report, so the caller can leave the
+    field unset rather than transmitting a confident zero.
+    """
+    if not isinstance(usage, dict):
+        return None
+    total = 0
+    for key in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"):
+        val = usage.get(key)
+        if isinstance(val, int) and val > 0:
+            total += val
+    return total or None
+
+
 @dataclass
 class StreamMessage:
     """Unified message type for streaming responses."""
@@ -1401,11 +1427,34 @@ class SessionManager:
             if hasattr(message, 'session_id') and message.session_id:
                 session_info.sdk_session_id = message.session_id
 
+            # `ResultMessage` has NO `input_tokens`/`output_tokens` attribute --
+            # only `usage: dict`. `getattr(message, 'input_tokens', None)`
+            # therefore returned None on EVERY turn, the proto conversion turned
+            # that into 0, and the client's `if message.input_tokens:` never
+            # fired. Every gRPC-backed session (TASCIM Tier 2 and Tier 3) showed
+            # a context battery pinned at 0% for its whole life, and every
+            # threshold keyed off it was dead. Measured on a live Tier 3
+            # container 2026-08-28: a turn costing $0.19 reported
+            # input_tokens=0, output_tokens=0.
+            #
+            # Summing the cache fields is not a refinement -- reading
+            # `usage["input_tokens"]` alone would report ~2 on a 465k-token
+            # prompt, which fails in the same silent, safe-looking direction.
+            usage = getattr(message, 'usage', None)
+            context_tokens = context_tokens_from_usage(usage)
+            if context_tokens:
+                # Also feed the session's own counter, which `GetSession`
+                # reports as `ContextUsage`. It was declared and defaulted to 0
+                # and then never assigned anywhere, so that RPC answered 0
+                # tokens / 0% for every session too -- a second dead readout of
+                # the same number.
+                session_info.context_tokens = context_tokens
+
             messages.append(StreamMessage(
                 type="cost",
                 cost_usd=getattr(message, 'total_cost_usd', None),
-                input_tokens=getattr(message, 'input_tokens', None),
-                output_tokens=getattr(message, 'output_tokens', None),
+                input_tokens=context_tokens,
+                output_tokens=(usage or {}).get('output_tokens') if isinstance(usage, dict) else None,
             ))
             messages.append(StreamMessage(
                 type="status",
