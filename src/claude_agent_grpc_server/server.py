@@ -36,10 +36,16 @@ class GRPCServer:
         host: str = "0.0.0.0",
         port: int = 50051,
         max_workers: int = 10,
+        address: Optional[str] = None,
     ):
         self.host = host
         self.port = port
         self.max_workers = max_workers
+        # S3/TAS-846: when set, `address` is the canonical bind target and wins
+        # over host/port. A `unix:///path` value binds a Unix domain socket, which
+        # removes the container's dependency on TCP networking, a shared L2 bridge
+        # and DHCP entirely. grpcio accepts `unix:///path` natively on both ends.
+        self.address = address
         self.server: Optional[aio.Server] = None
         self.session_manager = SessionManager()
         self._shutdown_event = asyncio.Event()
@@ -59,7 +65,10 @@ class GRPCServer:
 
         # Bind to address
         # Use explicit format - gRPC can have issues with address resolution in containers
-        if self.host in ("0.0.0.0", ""):
+        if self.address:
+            # Explicit target wins (e.g. a unix:/// socket, or a remote server).
+            address = self.address
+        elif self.host in ("0.0.0.0", ""):
             # Bind to all interfaces - try both IPv4 and IPv6
             address = f"[::]:{self.port}"
         else:
@@ -68,7 +77,7 @@ class GRPCServer:
         port_result = self.server.add_insecure_port(address)
         if port_result == 0:
             # If IPv6 failed, try IPv4 only
-            if address.startswith("[::]:"):
+            if not self.address and address.startswith("[::]:"):
                 logger.warning(f"Failed to bind to {address}, trying IPv4 only")
                 address = f"0.0.0.0:{self.port}"
                 port_result = self.server.add_insecure_port(address)
@@ -131,6 +140,7 @@ class GRPCServer:
 async def serve(
     host: str = "0.0.0.0",
     port: int = 50051,
+    address: Optional[str] = None,
 ) -> None:
     """
     Start the gRPC server.
@@ -138,8 +148,10 @@ async def serve(
     Args:
         host: Host address to bind to (default: 0.0.0.0)
         port: Port to listen on (default: 50051)
+        address: Optional explicit bind target (e.g. ``unix:///opt/grpc.sock``).
+            Wins over host/port when set.
     """
-    server = GRPCServer(host=host, port=port)
+    server = GRPCServer(host=host, port=port, address=address)
     await server.run()
 
 
@@ -148,12 +160,13 @@ def main() -> None:
     # Get configuration from environment
     host = os.getenv("GRPC_HOST", "0.0.0.0")
     port = int(os.getenv("GRPC_PORT", "50051"))
+    address = os.getenv("GRPC_ADDRESS") or None
 
     logger.info(f"Claude Agent gRPC Server v0.1.0")
-    logger.info(f"Configuration: host={host}, port={port}")
+    logger.info(f"Configuration: host={host}, port={port}, address={address}")
 
     try:
-        asyncio.run(serve(host=host, port=port))
+        asyncio.run(serve(host=host, port=port, address=address))
     except KeyboardInterrupt:
         logger.info("Server interrupted")
 
