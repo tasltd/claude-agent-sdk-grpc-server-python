@@ -134,6 +134,16 @@ class SessionConfig:
     settings_path: Optional[str] = None
 
 
+def session_cli_env(config: "SessionConfig") -> dict[str, str]:
+    """Added (TAS-1044): the env a session's CLI gets on top of this process's.
+
+    Every value is a string (the proto map is string to string); an empty or
+    missing environment is an empty dict, never None, because the SDK merges it
+    with ``**``.
+    """
+    return {str(k): str(v) for k, v in (getattr(config, "environment", None) or {}).items()}
+
+
 @dataclass
 class SessionInfo:
     """Information about an active Claude session."""
@@ -1285,6 +1295,13 @@ class SessionManager:
                 max_turns=config.max_turns,
                 continue_conversation=config.continue_conversation,
                 hooks=hooks if hooks else None,
+                # Added (TAS-1044): the session's own environment, which the host
+                # sends in SessionConfig.environment. It was stored and persisted
+                # but never applied, so a host could not point one session's CLI
+                # at its account router (ANTHROPIC_BASE_URL) without writing it
+                # into this process's environment for every session. The SDK
+                # merges it over the inherited process env.
+                env=session_cli_env(config),
             )
 
             # Create client if not exists
@@ -2098,6 +2115,10 @@ Respond with ONLY the summary, no preamble or explanation. Examples of good summ
                 cwd=config.project_path,
                 permission_mode="default",
                 max_turns=1,
+                # Added (TAS-1044): the summary call goes where the session's
+                # own calls go; without the base URL a routed session's
+                # placeholder token reaches the real API and is refused.
+                env=session_cli_env(config),
             ))
             await summary_client.connect()
 
