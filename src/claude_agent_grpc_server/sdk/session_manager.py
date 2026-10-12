@@ -16,6 +16,7 @@ from typing import AsyncIterator, Optional, List, Dict, Any, Callable, Tuple
 from datetime import datetime, timezone
 from pathlib import Path
 import asyncio
+import os
 import uuid
 import logging
 import json
@@ -142,6 +143,99 @@ def session_cli_env(config: "SessionConfig") -> dict[str, str]:
     with ``**``.
     """
     return {str(k): str(v) for k, v in (getattr(config, "environment", None) or {}).items()}
+
+
+# Added (TAS-1071, S3): one runner per host serves sessions that run in an app
+# sandbox. The host names the binary to start for such a session in its own
+# environment, so the binary is a session-supplied value and must never be
+# trusted as given: only paths this runner was configured with are accepted.
+CLI_PATH_VAR = "TASCIM_CLI_PATH"
+SANDBOX_ID_VAR = "TASCIM_SANDBOX_ID"
+ALLOWED_CLI_PATHS_VAR = "TASCIM_ALLOWED_CLI_PATHS"
+DEFAULT_ALLOWED_CLI_PATHS = ("/usr/libexec/tascim/sbx-cli",)
+# Lowercase canonical form only, because that is all sbx-cli accepts. A wider
+# check here would admit a session that then fails at exec with a worse error.
+_SANDBOX_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+_MAX_PATH = 4096
+
+
+class SessionRefusedError(ValueError):
+    """The session asked for something this runner will not do.
+
+    ``code`` is ``"denied"`` when the request is well formed but not allowed
+    here, and ``"invalid"`` when the request itself is malformed.
+    """
+
+    def __init__(self, message: str, code: str = "invalid") -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def allowed_cli_paths(environ: dict[str, str] | None = None) -> frozenset:
+    """The CLI paths this runner may start, from its own environment.
+
+    Unset means the default. Set but empty means none at all: an operator who
+    clears the list is switching the feature off, not asking for the default.
+    Relative entries are dropped, because they would resolve against whatever
+    directory the session runs in.
+    """
+    raw = (os.environ if environ is None else environ).get(ALLOWED_CLI_PATHS_VAR)
+    if raw is None:
+        return frozenset(DEFAULT_ALLOWED_CLI_PATHS)
+    kept = set()
+    for entry in raw.split(":"):
+        if not entry:
+            continue
+        if not entry.startswith("/"):
+            logger.warning(f"{ALLOWED_CLI_PATHS_VAR}: ignoring relative entry {entry[:200]!r}")
+            continue
+        kept.add(entry)
+    return frozenset(kept)
+
+
+def _shown(value: str) -> str:
+    return repr(value if len(value) <= 120 else value[:120] + "[truncated]")
+
+
+def session_cli_path(config: "SessionConfig", allowed: frozenset) -> str | None:
+    """The CLI binary for this session, or None for the runner's own CLI.
+
+    Raises SessionRefusedError when the session names a binary that is not on the
+    allowlist, or names one without a well-formed sandbox id. A sandbox id with
+    no binary is refused too: the host asked for a sandbox, and starting the
+    runner's own CLI instead would run the session outside it, silently.
+    """
+    env = session_cli_env(config)
+    path = env.get(CLI_PATH_VAR, "")
+    sandbox_id = env.get(SANDBOX_ID_VAR)
+
+    if not path:
+        if sandbox_id:
+            raise SessionRefusedError(
+                f"{SANDBOX_ID_VAR} was given without {CLI_PATH_VAR}, so this session "
+                f"would run outside its sandbox. Send both, or neither."
+            )
+        return None
+
+    if len(path) > _MAX_PATH or any(ord(ch) < 32 or ord(ch) == 127 for ch in path):
+        raise SessionRefusedError(f"{CLI_PATH_VAR} {_shown(path)} is not a valid path.")
+    if path not in allowed:
+        listed = ", ".join(sorted(allowed)) or "none"
+        raise SessionRefusedError(
+            f"{CLI_PATH_VAR} {_shown(path)} is not allowed on this runner. "
+            f"Allowed: {listed}. The runner sets these in {ALLOWED_CLI_PATHS_VAR}.",
+            code="denied",
+        )
+    if not sandbox_id:
+        raise SessionRefusedError(f"{CLI_PATH_VAR} needs {SANDBOX_ID_VAR}, and it is missing.")
+    if not _SANDBOX_ID.fullmatch(sandbox_id):
+        raise SessionRefusedError(
+            f"{SANDBOX_ID_VAR} {_shown(sandbox_id)} is not a lowercase UUID "
+            f"(8-4-4-4-12 hex digits)."
+        )
+    if not (os.path.isfile(path) and os.access(path, os.X_OK)):
+        raise SessionRefusedError(f"{CLI_PATH_VAR} {_shown(path)} is not an executable file on this runner.")
+    return path
 
 
 @dataclass
@@ -358,6 +452,11 @@ class SessionManager:
         # Find Claude CLI path for OAuth operations
         self._cli_path = self._find_cli()
 
+        # Added (TAS-1071): the per-session CLI paths this runner accepts, read
+        # once from the runner's own environment. A session's environment never
+        # reaches os.environ, so a session cannot widen this list.
+        self._allowed_cli_paths = allowed_cli_paths()
+
         # Ephemeral session credentials tracking
         # Maps session_id -> original env values to restore on cleanup
         self._ephemeral_credentials: Dict[str, Dict[str, Optional[str]]] = {}
@@ -366,6 +465,9 @@ class SessionManager:
 
     async def create_session(self, config: SessionConfig) -> SessionInfo:
         """Create a new Claude session."""
+        # Added (TAS-1071): refuse a bad CLI path before anything is set up for
+        # the session, so a refusal leaves no credentials or state behind.
+        session_cli_path(config, self._allowed_cli_paths)
         session_id = str(uuid.uuid4())
         project_name = config.project_path.split("/")[-1] or "unknown"
         session_name = f"{project_name}_{session_id[:6]}"
@@ -1302,6 +1404,9 @@ class SessionManager:
                 # into this process's environment for every session. The SDK
                 # merges it over the inherited process env.
                 env=session_cli_env(config),
+                # Added (TAS-1071): None keeps the SDK's own CLI discovery, so a
+                # session without TASCIM_CLI_PATH behaves exactly as before.
+                cli_path=session_cli_path(config, self._allowed_cli_paths),
             )
 
             # Create client if not exists
@@ -1688,6 +1793,9 @@ class SessionManager:
                 enable_dangerous_command_blocking=config_data.get("enable_dangerous_command_blocking", True),
                 headless=config_data.get("headless", True),
             )
+            # Added (TAS-1071): a saved session is checked against today's
+            # allowlist, not the one it was created under.
+            session_cli_path(config, self._allowed_cli_paths)
 
             session_info = SessionInfo(
                 id=session_data["id"],
@@ -2119,6 +2227,9 @@ Respond with ONLY the summary, no preamble or explanation. Examples of good summ
                 # own calls go; without the base URL a routed session's
                 # placeholder token reaches the real API and is refused.
                 env=session_cli_env(config),
+                # Added (TAS-1071): a sandboxed session's summary runs in the
+                # same sandbox, never on the runner itself.
+                cli_path=session_cli_path(config, self._allowed_cli_paths),
             ))
             await summary_client.connect()
 
