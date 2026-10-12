@@ -24,6 +24,8 @@ import re
 import time
 import subprocess
 import shutil
+from collections import deque
+from contextlib import suppress
 
 from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions
 from claude_agent_sdk.types import (
@@ -169,6 +171,79 @@ class SessionRefusedError(ValueError):
     def __init__(self, message: str, code: str = "invalid") -> None:
         super().__init__(message)
         self.code = code
+
+
+class CLIStartError(RuntimeError):
+    """The CLI process exited before the session finished starting."""
+
+
+# Added (TAS-1071): how often a starting session checks that its CLI is still
+# running. The SDK waits at least 60 s for the CLI's first reply and does not
+# notice the process has gone, so without this a CLI that refuses to start
+# (sbx-cli with no sandbox, a sudo rule missing) looked like a frozen session
+# for a full minute before anything was reported.
+START_POLL_SECONDS = 0.2
+STDERR_TAIL_LINES = 20
+
+
+def _process_of(client: Any) -> Any:
+    return getattr(getattr(client, "_transport", None), "_process", None)
+
+
+async def _explain(code: int, stderr_tail: "deque[str]") -> CLIStartError:
+    # The stderr reader runs beside the exit; give its last line a moment to land.
+    for _ in range(6):
+        if any(line.strip() for line in stderr_tail):
+            break
+        await asyncio.sleep(0.05)
+    said = next((line for line in reversed(stderr_tail) if line.strip()), "")
+    message = f"The agent program stopped while starting (exit code {code})."
+    if said:
+        message += f" It said: {said.strip()[:300]}"
+    return CLIStartError(message)
+
+
+async def connect_or_explain(client: Any, stderr_tail: "deque[str]",
+                             poll_seconds: float = START_POLL_SECONDS) -> None:
+    """``client.connect()``, but fail at once if the CLI exits while starting.
+
+    Two ways a dead CLI shows up: the SDK raises (a non-zero exit it noticed,
+    reported only as "Check stderr output for details"), or it waits out its
+    60 s floor (an exit it did not notice, such as code 0). Both become a
+    CLIStartError naming the exit code and the CLI's last stderr line, which for
+    sbx-cli is the reason it refused. Cancelling ``connect`` makes the SDK
+    disconnect and close the process, so nothing is left behind.
+    """
+    connecting = asyncio.ensure_future(client.connect())
+    # Held here because a failed connect disconnects first, and the SDK drops
+    # its own reference to the process before the error reaches us.
+    process = None
+    try:
+        while True:
+            done, _ = await asyncio.wait({connecting}, timeout=poll_seconds)
+            process = _process_of(client) or process
+            if connecting in done:
+                try:
+                    connecting.result()
+                except Exception as exc:
+                    code = getattr(process, "returncode", None)
+                    if code is None:
+                        code = getattr(exc, "exit_code", None)
+                    if code is None:
+                        raise
+                    raise await _explain(code, stderr_tail) from exc
+                return
+            code = getattr(process, "returncode", None)
+            if code is not None:
+                connecting.cancel()
+                with suppress(BaseException):
+                    await connecting
+                raise await _explain(code, stderr_tail)
+    finally:
+        if not connecting.done():
+            connecting.cancel()
+            with suppress(BaseException):
+                await connecting
 
 
 def allowed_cli_paths(environ: dict[str, str] | None = None) -> frozenset:
@@ -456,6 +531,9 @@ class SessionManager:
         # once from the runner's own environment. A session's environment never
         # reaches os.environ, so a session cannot widen this list.
         self._allowed_cli_paths = allowed_cli_paths()
+        # Added (TAS-1071): the last lines each session's CLI wrote to stderr,
+        # so a start-up failure can say why in the CLI's own words.
+        self._stderr_tails: Dict[str, deque] = {}
 
         # Ephemeral session credentials tracking
         # Maps session_id -> original env values to restore on cleanup
@@ -1407,12 +1485,15 @@ class SessionManager:
                 # Added (TAS-1071): None keeps the SDK's own CLI discovery, so a
                 # session without TASCIM_CLI_PATH behaves exactly as before.
                 cli_path=session_cli_path(config, self._allowed_cli_paths),
+                # Added (TAS-1071): the CLI's stderr is read per session rather
+                # than inherited, kept for start-up errors and still logged.
+                stderr=self._stderr_sink(session_id),
             )
 
             # Create client if not exists
             if client is None:
                 client = ClaudeSDKClient(options)
-                await client.connect()
+                await connect_or_explain(client, self._stderr_tails[session_id])
                 self._sessions[session_id] = (session_info, config, client)
 
             # Fix(TAS-624): the SDK stream is consumed by a persistent background
@@ -1497,6 +1578,15 @@ class SessionManager:
                 content=str(e),
                 is_error=True,
             )
+
+    def _stderr_sink(self, session_id: str) -> Callable[[str], None]:
+        tail = self._stderr_tails.setdefault(session_id, deque(maxlen=STDERR_TAIL_LINES))
+
+        def sink(line: str) -> None:
+            tail.append(line)
+            logger.info(f"Session {session_id}: CLI stderr: {line.rstrip()[:500]}")
+
+        return sink
 
     def _convert_message(self, message: Any, session_info: SessionInfo) -> List[StreamMessage]:
         """Convert SDK message to StreamMessage(s)."""
@@ -1629,6 +1719,7 @@ class SessionManager:
                 # Unconditional: the session is going away, release everyone.
                 queue.put_nowait(_TurnEnd(None))
             self._dropped_messages.pop(session_id, None)
+            self._stderr_tails.pop(session_id, None)
             self._prompt_seq.pop(session_id, None)
             self._result_seq.pop(session_id, None)
 

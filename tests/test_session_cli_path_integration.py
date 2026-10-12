@@ -17,6 +17,7 @@ import asyncio
 import json
 import os
 import stat
+import time
 from pathlib import Path
 
 import claude_agent_sdk
@@ -168,6 +169,76 @@ async def test_a_cli_that_exits_at_once_still_proves_it_was_started(offline, tmp
 
     assert [c["sandbox_id"] for c in _calls(log) if "--output-format" in c["argv"]] == [SBX_A]
     assert any(m.type == "error" for m in msgs), "a CLI that exits at once must surface an error"
+
+
+async def test_a_cli_that_refuses_to_start_is_reported_in_seconds(offline, tmp_path, monkeypatch):
+    """The sbx-exec refusal a person would hit, said in its own words, in seconds not a minute."""
+    log = tmp_path / "calls.jsonl"
+    cli = _wrapper(tmp_path / "sbx-cli", log,
+                   'echo "sbx-exec: sandbox $TASCIM_SANDBOX_ID is not running" >&2; exit 69')
+    manager = _manager(monkeypatch, cli)
+
+    info = await manager.create_session(_config(offline, cli, SBX_A))
+    start = time.monotonic()
+    msgs = await _turn(manager, info.id)
+    took = time.monotonic() - start
+    await manager.delete_session(info.id)
+
+    errors = [m.content for m in msgs if m.type == "error"]
+    assert took < 10, f"the refusal took {took:.1f}s to surface"
+    assert len(errors) == 1, errors
+    assert "exit code 69" in errors[0]
+    assert f"sandbox {SBX_A} is not running" in errors[0]
+
+
+async def test_a_running_turn_stops_when_interrupted(offline, tmp_path, monkeypatch):
+    """Plan risk R2: the turn is held open by an API that never answers, then interrupted."""
+    reached = asyncio.Event()
+
+    async def silent_api(reader, writer):
+        reached.set()
+        try:
+            await reader.read(65536)
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            writer.close()
+
+    server = await asyncio.start_server(silent_api, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    log = tmp_path / "calls.jsonl"
+    cli = _wrapper(tmp_path / "sbx-cli", log, f'exec "{BUNDLED_CLI}" "$@"')
+    manager = _manager(monkeypatch, cli)
+    config = _config(offline, cli, SBX_A)
+    config.environment.update({"ANTHROPIC_API_KEY": "sk-ant-test-not-real",
+                               "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{port}"})
+    info = await manager.create_session(config)
+
+    turn = asyncio.ensure_future(_turn(manager, info.id))
+    try:
+        await asyncio.wait_for(reached.wait(), timeout=60)
+        await asyncio.sleep(1.0)
+        assert not turn.done(), "the turn ended before it could be interrupted"
+
+        start = time.monotonic()
+        assert await manager.interrupt(info.id) is True
+        await asyncio.wait_for(turn, timeout=10)
+        stopped_in = time.monotonic() - start
+        assert stopped_in < 5, f"the turn took {stopped_in:.1f}s to stop"
+
+        pid = next(c["pid"] for c in _calls(log) if "--output-format" in c["argv"])
+        assert _alive(pid), "an interrupt stops the turn, not the session"
+        await manager.delete_session(info.id)
+        for _ in range(50):
+            if not _alive(pid):
+                break
+            await asyncio.sleep(0.1)
+        assert not _alive(pid)
+    finally:
+        if not turn.done():
+            turn.cancel()
+        server.close()
 
 
 async def test_two_concurrent_sessions_start_their_own_cli(offline, tmp_path, monkeypatch):
