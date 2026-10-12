@@ -13,7 +13,7 @@ import logging
 
 from ..proto import claude_agent_pb2 as pb2
 from ..proto import claude_agent_pb2_grpc as pb2_grpc
-from ..sdk.session_manager import SessionManager, SessionConfig, StreamMessage
+from ..sdk.session_manager import SessionManager, SessionConfig, SessionRefusedError, StreamMessage
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +97,12 @@ class ClaudeAgentServicer(pb2_grpc.ClaudeAgentServiceServicer):
                 user_email=session.user_email or "",
                 has_ephemeral_credentials=session.has_ephemeral_credentials,
             )
+        except SessionRefusedError as e:
+            # Added (TAS-1071): a refusal is the caller's request, not a server
+            # fault, so it is not reported as INTERNAL.
+            logger.warning(f"CreateSession refused: {e}")
+            code = grpc.StatusCode.PERMISSION_DENIED if e.code == "denied" else grpc.StatusCode.INVALID_ARGUMENT
+            await context.abort(code, str(e))
         except Exception as e:
             logger.error(f"CreateSession failed: {e}")
             await context.abort(grpc.StatusCode.INTERNAL, str(e))
