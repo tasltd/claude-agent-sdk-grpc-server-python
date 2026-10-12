@@ -164,11 +164,16 @@ async def test_a_cli_that_exits_at_once_still_proves_it_was_started(offline, tmp
     manager = _manager(monkeypatch, cli)
 
     info = await manager.create_session(_config(offline, cli, SBX_A))
+    start = time.monotonic()
     msgs = await _turn(manager, info.id)
+    took = time.monotonic() - start
     await manager.delete_session(info.id)
 
     assert [c["sandbox_id"] for c in _calls(log) if "--output-format" in c["argv"]] == [SBX_A]
-    assert any(m.type == "error" for m in msgs), "a CLI that exits at once must surface an error"
+    errors = [m.content for m in msgs if m.type == "error"]
+    assert errors and "exit code 0" in errors[0], errors
+    # Exit code 0 is the case the SDK never notices: it would wait its full 60 s.
+    assert took < 10, f"the exit took {took:.1f}s to surface"
 
 
 async def test_a_cli_that_refuses_to_start_is_reported_in_seconds(offline, tmp_path, monkeypatch):
